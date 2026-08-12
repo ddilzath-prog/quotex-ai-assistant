@@ -246,7 +246,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main():
 
     print("===================================")
-    prinprint("QUOTEX AI ASSISTANT")
+    print("QUOTEX AI ASSISTANT")
     print("Starting...")
     print("===================================")
 
