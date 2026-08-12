@@ -61,7 +61,7 @@ def run_web_server():
 # =========================================================
 
 SYSTEM_PROMPT = """
-You are FAYA AI Trading Signal Assistant.
+You are Quotex AI Assistant.
 
 Analyze the provided trading chart image carefully.
 
@@ -164,7 +164,7 @@ def analyze_chart(image_bytes: bytes) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
-        "📊 FAYA AI Trading Signal Assistant\n\n"
+        "🤖 QUOTEX AI ASSISTANT\n"
         "Send me a trading chart screenshot.\n"
         "I will analyze it and return:\n\n"
         "NEXT CANDLE\n"
@@ -246,7 +246,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main():
 
     print("===================================")
-    print("FAYA AI TRADING BOT")
+    prinprint("QUOTEX AI ASSISTANT")
     print("Starting...")
     print("===================================")
 
@@ -286,7 +286,7 @@ def main():
     telegram_app.add_error_handler(error_handler)
 
     print("Telegram bot started.")
-    print("FAYA AI is ready.")
+    print("Quotex AI Assistant is ready.")
 
     telegram_app.run_polling(
         drop_pending_updates=True
