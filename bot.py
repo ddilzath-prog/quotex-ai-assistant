@@ -42,7 +42,7 @@ app = Flask(__name__)
 def home():
     return jsonify({
         "status": "online",
-        "bot": "FAYA AI Trading Signal Assistant"
+        "bot": "Quotex AI Assistant"
     })
 
 
