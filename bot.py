@@ -79,24 +79,24 @@ SIGNAL RULE:
 1. Estimate UP probability and DOWN probability.
 2. UP + DOWN MUST equal exactly 100%.
 3. CONFIDENCE MUST equal the higher of UP and DOWN.
-4. If UP is 70% or higher:
+4. If UP is 90% or higher:
    NEXT CANDLE = UP
-5. If DOWN is 70% or higher:
+5. If DOWN is 90% or higher:
    NEXT CANDLE = DOWN
-6. Only if BOTH UP and DOWN are below 70%:
+6. Only if BOTH UP and DOWN are below 90%:
    NEXT CANDLE = NO TRADE
 7. Never claim certainty or guaranteed accuracy.
 8. Never invent unseen market data.
 
 IMPORTANT EXAMPLES:
 
-If UP = 70% and DOWN = 39%:
+If UP = 90% and DOWN = 39%:
 NEXT CANDLE = UP
 
-If UP = 69% and DOWN = 51%:
+If UP = 89% and DOWN = 51%:
 NEXT CANDLE = NO TRADE
 
-If UP = 30% and DOWN = 70%:
+If UP = 30% and DOWN = 90%:
 NEXT CANDLE = DOWN
 
 OUTPUT ONLY THIS EXACT FORMAT:
