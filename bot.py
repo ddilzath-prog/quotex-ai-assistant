@@ -503,10 +503,13 @@ Schema:
   "market": "BINANCE FUTURES",
   "timeframe": "15m",
 
-  "signal": "LONG",
-  "long_probability": 0,
-  "short_probability": 0,
-  "confidence": 0,
+  "signal": "LONG | SHORT | NO TRADE",
+"long_probability": 0,
+"short_probability": 0,
+"confidence": 0,
+"candidate_direction": "LONG | SHORT | NONE",
+"candidate_confidence": 0,
+"setup_score": 0,
 
   "trend": "Bullish",
   "market_structure": "Strong",
