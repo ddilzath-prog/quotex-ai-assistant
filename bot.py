@@ -489,7 +489,42 @@ QUALITY > QUANTITY
 When evidence conflicts:
 
 NO TRADE
+IMPORTANT CANDIDATE RULE:
 
+Always identify the strongest directional candidate
+BEFORE applying the final quality gate.
+
+If LONG evidence is stronger:
+candidate_direction = "LONG"
+
+If SHORT evidence is stronger:
+candidate_direction = "SHORT"
+
+The candidate probability and candidate confidence
+must represent the actual market analysis.
+
+If the quality gate rejects the setup:
+
+signal = "NO TRADE"
+
+BUT DO NOT reset the candidate values to zero.
+
+For example:
+
+candidate_direction = "SHORT"
+candidate_confidence = 85
+setup_score = 72
+signal = "NO TRADE"
+
+NO TRADE means the setup failed the final quality gate.
+It does NOT mean that the directional analysis was zero.
+
+Always preserve:
+- candidate_direction
+- candidate_confidence
+- actual setup_score
+
+even when signal = "NO TRADE".
 ============================================================
 OUTPUT
 ============================================================
