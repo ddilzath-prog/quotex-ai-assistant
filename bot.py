@@ -1,12 +1,18 @@
 import os
-import base64
-import json
 import re
+import io
+import json
+import time
+import base64
+import sqlite3
+import asyncio
 import threading
-from io import BytesIO
-from collections import defaultdict, deque
+from datetime import datetime, timezone
+from collections import defaultdict
 
 from flask import Flask, jsonify
+from PIL import Image
+
 from openai import OpenAI
 
 from telegram import Update
@@ -18,1727 +24,2037 @@ from telegram.ext import (
     filters,
 )
 
-
-# =========================================================
+# ============================================================
 # CONFIG
-# =========================================================
+# ============================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-OPENAI_MODEL = os.getenv(
-    "OPENAI_MODEL",
-    "gpt-5-mini"
-)
+MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "80"))
+MIN_SETUP_SCORE = int(os.getenv("MIN_SETUP_SCORE", "70"))
 
-MIN_CONFIDENCE = int(
-    os.getenv("MIN_CONFIDENCE", "80")
-)
+MAX_IMAGE_MB = 8
+MAX_IMAGES = 3
+COOLDOWN_SECONDS = 5
 
-MAX_HISTORY = int(
-    os.getenv("MAX_HISTORY", "5")
-)
+PORT = int(os.getenv("PORT", "10000"))
 
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
-
+DB_PATH = os.getenv("DB_PATH", "signals.db")
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN environment variable is missing."
-    )
+    raise RuntimeError("BOT_TOKEN is missing")
 
 if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "OPENAI_API_KEY environment variable is missing."
-    )
+    raise RuntimeError("OPENAI_API_KEY is missing")
 
 
-client = OpenAI(
-    api_key=OPENAI_API_KEY
-)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-# =========================================================
-# ANALYSIS MEMORY
-# =========================================================
-
-chat_history = defaultdict(
-    lambda: deque(
-        maxlen=MAX_HISTORY
-    )
-)
-
-
-# =========================================================
-# RENDER HEALTH SERVER
-# =========================================================
+# ============================================================
+# FLASK HEALTH SERVER
+# ============================================================
 
 app = Flask(__name__)
 
 
-@app.get("/")
+@app.route("/")
 def home():
-
     return jsonify({
-        "status": "online",
         "bot": "Binance Futures AI Assistant",
-        "version": "1.0",
-        "mode": "Screenshot Analysis"
+        "mode": "Screenshot Analysis",
+        "version": "3.0 Unified",
+        "status": "online"
     })
 
 
-@app.get("/health")
+@app.route("/health")
 def health():
-
     return jsonify({
         "status": "healthy"
     })
 
 
-@app.get("/status")
-def status():
-
-    return jsonify({
-        "status": "running",
-        "model": OPENAI_MODEL,
-        "confidence_threshold": MIN_CONFIDENCE,
-        "history": MAX_HISTORY
-    })
-
-
-def run_web_server():
-
-    port = int(
-        os.getenv("PORT", "10000")
-    )
-
+def run_flask():
     app.run(
         host="0.0.0.0",
-        port=port
+        port=PORT,
+        debug=False,
+        use_reloader=False
     )
 
 
-# =========================================================
-# BINANCE FUTURES AI SYSTEM PROMPT
-# =========================================================
+# ============================================================
+# DATABASE
+# ============================================================
 
-SYSTEM_PROMPT = f"""
-You are BINANCE FUTURES AI ASSISTANT.
+db_lock = threading.Lock()
 
-Your task is to analyze a Binance Futures trading
-chart screenshot.
 
-This is a SCREENSHOT-BASED analysis system.
+def get_db():
+    conn = sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
 
-Do NOT place trades.
 
-Do NOT claim guaranteed profit.
+def init_db():
 
-Do NOT claim 99% or 100% accuracy.
+    with db_lock:
 
-The purpose is to identify high-quality setups
-and reject weak setups.
+        conn = get_db()
 
-QUALITY > QUANTITY.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
 
-If the chart does not provide enough confirmation:
+                symbol TEXT,
+                timeframe TEXT,
 
-NO TRADE.
+                signal TEXT,
 
-========================================================
-SCREENSHOT ANALYSIS
-========================================================
+                long_probability INTEGER,
+                short_probability INTEGER,
+                confidence INTEGER,
 
-Analyze the ENTIRE visible screenshot.
+                setup_score INTEGER,
 
-Do not analyze only the latest candle.
+                risk TEXT,
 
-Read all visible information including:
+                entry_zone TEXT,
+                stop_loss TEXT,
+                take_profit TEXT,
 
-- Trading pair
-- Futures / Perpetual
-- Current price
-- Timeframe
-- Candles
-- Moving averages
-- Volume
-- Visible order book
-- Long/Short ratio if visible
-- Support
-- Resistance
-- Previous highs
-- Previous lows
-- Breakout areas
-- Rejection areas
+                risk_reward REAL,
 
-Only use information actually visible.
+                reason TEXT,
 
-If something is not visible:
+                outcome TEXT
+            )
+        """)
 
-mark it UNKNOWN.
+        conn.commit()
+        conn.close()
 
-Never invent data.
 
-========================================================
-1. MARKET STRUCTURE
-========================================================
+# ============================================================
+# RUNTIME STATE
+# ============================================================
+
+pending_multi = defaultdict(dict)
+multi_mode = defaultdict(bool)
+
+last_analysis_time = defaultdict(float)
+last_signal_id = defaultdict(int)
+
+
+# ============================================================
+# IMAGE PROCESSING
+# ============================================================
+
+def prepare_image(image_bytes: bytes) -> bytes:
+
+    image = Image.open(io.BytesIO(image_bytes))
+
+    image = image.convert("RGB")
+
+    # Keep image large enough for chart analysis
+    image.thumbnail((2400, 2400))
+
+    output = io.BytesIO()
+
+    image.save(
+        output,
+        format="JPEG",
+        quality=90,
+        optimize=True
+    )
+
+    result = output.getvalue()
+
+    # Safety reduction if still too large
+    if len(result) > MAX_IMAGE_MB * 1024 * 1024:
+
+        output = io.BytesIO()
+
+        image.save(
+            output,
+            format="JPEG",
+            quality=75,
+            optimize=True
+        )
+
+        result = output.getvalue()
+
+    return result
+
+
+def image_to_base64(image_bytes: bytes) -> str:
+
+    return base64.b64encode(image_bytes).decode("utf-8")
+
+
+# ============================================================
+# TIMEFRAME DETECTION
+# ============================================================
+
+def extract_timeframe(text):
+
+    if not text:
+        return None
+
+    text = text.lower()
+
+    patterns = [
+        r"\b1m\b",
+        r"\b3m\b",
+        r"\b5m\b",
+        r"\b15m\b",
+        r"\b30m\b",
+        r"\b1h\b",
+        r"\b2h\b",
+        r"\b4h\b",
+        r"\b6h\b",
+        r"\b12h\b",
+        r"\b1d\b"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(pattern, text)
+
+        if match:
+            return match.group(0)
+
+    return None
+
+
+# ============================================================
+# AI SYSTEM PROMPT
+# ============================================================
+
+SYSTEM_PROMPT = r"""
+You are an extremely strict Binance Futures screenshot-analysis engine.
+
+Your purpose is NOT to guarantee profit.
+
+Your job is to analyze only what is actually visible in the supplied
+chart screenshots and produce a conservative trading setup assessment.
+
+Never invent:
+
+- price
+- volume
+- order book
+- long/short ratio
+- indicators
+- support/resistance
+- liquidity
+- candles
+- timeframe
+- market structure
+- news
+- fundamentals
+
+If something is not visible or cannot be reliably inferred from the chart,
+return "Unclear" or "Unavailable".
+
+============================================================
+CORE ANALYSIS
+============================================================
 
 Analyze:
 
-Higher High
-Higher Low
-Lower High
-Lower Low
+1. Market trend
+2. Market structure
+3. Higher-high / higher-low
+4. Lower-high / lower-low
+5. Break of structure
+6. Change of character
+7. Support
+8. Resistance
+9. Supply / demand zones when visually justified
+10. Momentum
+11. Candle psychology
+12. Wick rejection
+13. Body strength
+14. Consecutive candle pressure
+15. Absorption
+16. Breakout
+17. Fake breakout
+18. Liquidity sweep
+19. Stop-hunt style movement
+20. Trap
+21. Exhaustion
+22. Volume only if visible
+23. Order book only if visible
+24. Long/short ratio only if visible
 
-Identify:
+============================================================
+CANDLE PSYCHOLOGY
+============================================================
 
-BULLISH
-BEARISH
-RANGE
-UNCLEAR
+Study:
 
-Determine:
-
-STRONG
-MODERATE
-WEAK
-UNCLEAR
-
-========================================================
-2. CANDLE PSYCHOLOGY
-========================================================
-
-Analyze:
-
-- candle body size
-- upper wick
-- lower wick
-- rejection
+- strong bullish bodies
+- strong bearish bodies
+- small bodies
+- doji
+- long upper wick
+- long lower wick
+- rejection candles
+- engulfing behavior
 - consecutive candles
-- engulfing behaviour
-- momentum candles
-- indecision candles
-- compression
-- expansion
 - failed continuation
-- reversal behaviour
+- candle close location
 
-Do not make a decision from one candle alone.
+Interpret the candles as evidence of:
 
-========================================================
-3. MOMENTUM
-========================================================
-
-Check:
-
-- directional candle sequence
-- body expansion
-- body contraction
-- acceleration
-- deceleration
-- opposite candle pressure
-- momentum loss
-
-Classify:
-
-STRONG
-MODERATE
-WEAK
-UNCLEAR
-
-========================================================
-4. SUPPORT
-========================================================
-
-Find visible support zones.
-
-Check:
-
-- previous reactions
-- multiple touches
+- buying pressure
+- selling pressure
+- hesitation
 - rejection
-- breakdown
-- retest
+- absorption
+- possible exhaustion
 
-Classify:
+Do NOT treat one candle as enough evidence by itself.
 
-CONFIRMED
-WEAK
-UNCLEAR
+============================================================
+MARKET / TRADER PSYCHOLOGY
+============================================================
 
-========================================================
-5. RESISTANCE
-========================================================
+Analyze visible evidence of:
 
-Find visible resistance zones.
+- FOMO buying
+- panic selling
+- late entries
+- trapped buyers
+- trapped sellers
+- stop-loss hunting
+- liquidity sweep
+- breakout chasing
+- rejection after aggressive move
+- crowd positioning
+- absorption
+- fear-driven selling
+- greed-driven buying
 
-Check:
+These are behavioral interpretations of chart structure,
+NOT guaranteed facts about individual traders.
 
-- previous reactions
-- multiple touches
-- rejection
-- breakout
-- retest
+Only report them when chart evidence supports them.
 
-Classify:
+============================================================
+FINANCIAL / MARKET PSYCHOLOGY
+============================================================
 
-CONFIRMED
-WEAK
-UNCLEAR
+Consider:
 
-========================================================
-6. BREAKOUT
-========================================================
+- momentum chasing
+- risk-off behavior visible in price action
+- aggressive expansion
+- compression before expansion
+- distribution
+- accumulation
+- capitulation-style movement
+- failed breakout
+- failed breakdown
+- liquidity grab
+- continuation pressure
+- exhaustion
 
-Determine:
+Do not invent macroeconomic information.
 
-CONFIRMED BREAKOUT
-WEAK BREAKOUT
-FALSE BREAKOUT
-NO BREAKOUT
-UNCLEAR
-
-A breakout should have supporting price action.
-
-========================================================
-7. TRAP PSYCHOLOGY
-========================================================
+============================================================
+SUPPORT / RESISTANCE
+============================================================
 
 Look for:
 
-- Bull Trap
-- Bear Trap
-- False Breakout
-- Liquidity-sweep-like behaviour
-- Strong rejection
+- repeated reactions
+- swing highs
+- swing lows
+- rejection zones
+- consolidation boundaries
+- breakout levels
+- retest zones
 
-Do not claim actual broker liquidity.
+Do not call a level "confirmed" unless chart evidence supports it.
 
-These are chart interpretations only.
+============================================================
+BREAKOUT LOGIC
+============================================================
 
-========================================================
-8. EXHAUSTION
-========================================================
+Distinguish:
+
+- confirmed breakout
+- weak breakout
+- fake breakout
+- liquidity sweep
+- no breakout
+
+A wick through a level followed by rejection can indicate a
+possible false breakout / liquidity sweep.
+
+============================================================
+TRAP LOGIC
+============================================================
+
+Detect:
+
+- bull trap
+- bear trap
+- possible trap
+
+If a trap is reasonably possible, prefer NO TRADE.
+
+============================================================
+EXHAUSTION
+============================================================
 
 Check for:
 
-- large candles
-- long wicks
+- extended move
+- repeated large candles
 - shrinking bodies
-- repeated rejection
-- failure to continue
-- support/resistance pressure
-- opposite candle pressure
-
-Classify:
-
-HIGH
-MEDIUM
-LOW
-UNCLEAR
-
-========================================================
-9. CONTINUATION
-========================================================
-
-Determine:
-
-LIKELY
-UNLIKELY
-UNCLEAR
-
-Use:
-
-- market structure
-- candle psychology
-- momentum
-- support/resistance
-- breakout confirmation
-- trap risk
-
-========================================================
-10. REVERSAL
-========================================================
-
-A reversal should require multiple confirmations.
-
-Possible confirmations:
-
-- strong rejection
-- momentum weakening
-- structure change
+- long rejection wicks
 - failed continuation
-- support/resistance interaction
-- opposite candle confirmation
+- momentum loss
+- divergence-like visual behavior if actually visible
 
-Never call reversal from one wick alone.
+High exhaustion should strongly reduce trade confidence.
 
-========================================================
-11. MOVING AVERAGES
-========================================================
+============================================================
+MULTI-TIMEFRAME
+============================================================
 
-If MA/EMA is visible:
+If multiple screenshots are supplied:
 
-Analyze:
+Compare all available timeframes.
 
-- price relative to MA
-- MA direction
-- MA separation
-- crossover
-- dynamic support/resistance
-- compression
+Look for:
 
-Do NOT invent an MA value.
+- trend alignment
+- structure alignment
+- momentum alignment
+- support/resistance alignment
+- breakout alignment
 
-========================================================
-12. VOLUME
-========================================================
+If timeframes materially disagree, return:
 
-If volume is visible:
+mtf_alignment = "Mixed"
 
-Analyze:
+and prefer NO TRADE.
 
-- volume expansion
-- volume contraction
-- breakout volume
-- rejection volume
-- unusual volume spike
+============================================================
+ENTRY / SL / TP
+============================================================
 
-Do not assume volume if it is not visible.
+Only provide:
 
-========================================================
-13. ORDER BOOK
-========================================================
+- entry zone
+- stop loss
+- take profit
+- risk/reward
 
-If order book is visible:
+when they can be reasonably derived from visible chart structure.
 
-Analyze only visible information.
+Never invent exact prices.
 
-Possible observations:
+If unavailable:
 
-- bid/ask imbalance
-- visible concentration
-- pressure near current price
+"UNKNOWN"
 
-IMPORTANT:
+============================================================
+SIGNAL RULE
+============================================================
 
-Order-book information can change quickly.
-
-Do not treat it as guaranteed future direction.
-
-If order book is not visible:
-
-UNKNOWN.
-
-========================================================
-14. LONG / SHORT RATIO
-========================================================
-
-If a Long/Short ratio is visible:
-
-Record it.
-
-Do not assume that a high Long ratio automatically
-means SHORT.
-
-Do not assume that a high Short ratio automatically
-means LONG.
-
-Use it only as supporting evidence.
-
-========================================================
-15. MULTI-CONFIRMATION
-========================================================
-
-A directional signal requires agreement between
-multiple independent factors.
-
-For LONG:
-
-Prefer:
-
-- bullish structure
-- bullish candle psychology
-- supportive momentum
-- support/retest
-- confirmed breakout OR strong rejection
-- acceptable volume
-- no strong bear trap
-- confirmation good/strong
-
-For SHORT:
-
-Prefer:
-
-- bearish structure
-- bearish candle psychology
-- bearish momentum
-- resistance/retest
-- confirmed breakdown OR strong rejection
-- acceptable volume
-- no strong bull trap
-- confirmation good/strong
-
-========================================================
-16. CONFLICT FILTER
-========================================================
-
-If major factors conflict:
-
-NO TRADE.
-
-Examples:
-
-Bullish trend + strong resistance rejection
-= caution
-
-Bearish trend + strong support rejection
-= caution
-
-Breakout + immediate failure
-= caution
-
-Strong momentum + extreme exhaustion
-= caution
-
-Unclear structure
-= NO TRADE
-
-========================================================
-17. CONFIDENCE
-========================================================
-
-Return:
-
-LONG probability
-SHORT probability
-
-LONG + SHORT MUST equal exactly 100.
-
-CONFIDENCE =
-higher of LONG and SHORT.
-
-Minimum directional threshold:
-
-{MIN_CONFIDENCE}%
-
-If:
-
-LONG >= {MIN_CONFIDENCE}
-
-AND confirmations are strong enough:
-
-candidate = LONG
-
-If:
-
-SHORT >= {MIN_CONFIDENCE}
-
-AND confirmations are strong enough:
-
-candidate = SHORT
-
-Otherwise:
-
-NO TRADE
-
-IMPORTANT:
-
-Confidence is an analytical estimate.
-
-It is NOT a guaranteed win probability.
-
-========================================================
-18. RISK
-========================================================
-
-Classify:
-
-LOW
-MEDIUM
-HIGH
-
-High risk:
-
-NO TRADE.
-
-========================================================
-19. ENTRY / STOP / TARGET
-========================================================
-
-If the screenshot provides enough visible price
-information:
-
-You may estimate:
-
-ENTRY_ZONE
-STOP_LOSS_LEVEL
-TAKE_PROFIT_LEVEL
-
-But:
-
-Never invent exact levels.
-
-If levels cannot be reliably determined:
-
-return UNKNOWN.
-
-Use price levels visible in the screenshot.
-
-Do not claim guaranteed targets.
-
-========================================================
-20. FINAL DECISION
-========================================================
-
-The final signal must be one of:
+Candidate signals:
 
 LONG
 SHORT
 NO TRADE
 
-Use NO TRADE when:
+A high confidence number alone is NOT enough.
 
-- confidence < threshold
-- structure unclear
-- confirmation weak
-- risk high
-- major factors conflict
-- chart visibility is poor
-- price location is dangerous
-- setup depends on guessing
+The final system should prefer:
 
-========================================================
+QUALITY > QUANTITY
+
+When evidence conflicts:
+
+NO TRADE
+
+============================================================
 OUTPUT
-========================================================
+============================================================
 
 Return ONLY valid JSON.
 
-Use EXACTLY this structure:
+Schema:
 
-{{
-    "symbol": "ETHUSDT",
-    "market": "BINANCE FUTURES",
-    "timeframe": "15m",
+{
+  "symbol": "ETHUSDT",
+  "market": "BINANCE FUTURES",
+  "timeframe": "15m",
 
-    "signal": "LONG | SHORT | NO TRADE",
+  "signal": "LONG",
+  "long_probability": 0,
+  "short_probability": 0,
+  "confidence": 0,
 
-    "long_probability": 0,
-    "short_probability": 0,
-    "confidence": 0,
+  "trend": "Bullish",
+  "market_structure": "Strong",
+  "candle_psychology": "Bullish",
+  "momentum": "Strong",
 
-    "trend": "Bullish | Bearish | Range | Unclear",
+  "support": "Confirmed",
+  "support_zone": "text or UNKNOWN",
 
-    "market_structure": "Strong | Moderate | Weak | Unclear",
+  "resistance": "Confirmed",
+  "resistance_zone": "text or UNKNOWN",
 
-    "candle_psychology": "Bullish | Bearish | Mixed | Unclear",
+  "breakout": "Confirmed Up",
+  "trap": "None",
 
-    "momentum": "Strong | Moderate | Weak | Unclear",
+  "continuation": "Likely",
+  "reversal": "Unlikely",
 
-    "support": "Confirmed | Weak | Unclear",
+  "exhaustion": "Low",
 
-    "resistance": "Confirmed | Weak | Unclear",
+  "volume": "Strong",
+  "order_book": "Bullish",
+  "long_short_ratio": "Bullish Bias",
 
-    "breakout": "Confirmed | Weak | False Breakout | None | Unclear",
+  "mtf_alignment": "Single timeframe",
 
-    "trap": "Bull Trap | Bear Trap | Possible Trap | None | Unclear",
+  "data_quality": "Good",
 
-    "continuation": "Likely | Unlikely | Unclear",
+  "risk": "Low",
 
-    "reversal": "Likely | Unlikely | Unclear",
+  "entry_zone": "text or UNKNOWN",
+  "stop_loss": "text or UNKNOWN",
+  "take_profit": "text or UNKNOWN",
+  "risk_reward": 0,
 
-    "exhaustion": "High | Medium | Low | Unclear",
+  "timeframe_views": [
+    {
+      "timeframe": "15m",
+      "bias": "Bullish",
+      "confidence": 0
+    }
+  ],
 
-    "volume": "Strong | Normal | Weak | Unclear",
+  "evidence": [
+    "short factual observation",
+    "short factual observation",
+    "short factual observation"
+  ],
 
-    "order_book": "Bullish | Bearish | Balanced | Unclear",
+  "reason": "short factual explanation"
+}
 
-    "long_short_ratio": "Bullish Bias | Bearish Bias | Balanced | Unavailable",
+Probability values are estimates from visual evidence,
+NOT guaranteed win probabilities.
 
-    "confirmation": "Strong | Good | Weak | Unclear",
-
-    "risk": "Low | Medium | High",
-
-    "entry_zone": "text or UNKNOWN",
-
-    "stop_loss": "text or UNKNOWN",
-
-    "take_profit": "text or UNKNOWN",
-
-    "reason": "Short factual explanation"
-}}
-
-Probabilities MUST be integers.
-
-LONG + SHORT must equal exactly 100.
-
-Never output markdown.
-
-Never output anything outside JSON.
+Never return commentary outside JSON.
 """
 
 
-# =========================================================
-# IMAGE PREPARATION
-# =========================================================
+# ============================================================
+# JSON EXTRACTION
+# ============================================================
 
-def prepare_image(
-    image_bytes: bytes
-) -> bytes:
-
-    if len(image_bytes) <= MAX_IMAGE_BYTES:
-        return image_bytes
-
-    try:
-
-        from PIL import Image
-
-        image = Image.open(
-            BytesIO(image_bytes)
-        )
-
-        image.thumbnail(
-            (2400, 2400)
-        )
-
-        output = BytesIO()
-
-        image.convert("RGB").save(
-            output,
-            format="JPEG",
-            quality=88,
-            optimize=True
-        )
-
-        return output.getvalue()
-
-    except Exception as error:
-
-        print(
-            "IMAGE PREPARATION ERROR:",
-            repr(error)
-        )
-
-        return image_bytes
-
-
-# =========================================================
-# JSON PARSER
-# =========================================================
-
-def extract_json(
-    text: str
-) -> dict:
+def extract_json(text: str):
 
     text = text.strip()
 
-    try:
-
-        return json.loads(text)
-
-    except Exception:
-
-        pass
-
-
-    cleaned = re.sub(
-        r"```json",
+    # Remove markdown fences if model accidentally adds them
+    text = re.sub(
+        r"^```(?:json)?",
         "",
         text,
         flags=re.IGNORECASE
     )
 
-    cleaned = cleaned.replace(
-        "```",
-        ""
-    ).strip()
+    text = re.sub(
+        r"```$",
+        "",
+        text
+    )
 
+    text = text.strip()
 
     try:
-
-        return json.loads(
-            cleaned
-        )
+        return json.loads(text)
 
     except Exception:
-
         pass
 
+    # Try extracting first JSON object
+    start = text.find("{")
+    end = text.rfind("}")
 
-    match = re.search(
-        r"\{.*\}",
-        cleaned,
-        flags=re.DOTALL
-    )
+    if start >= 0 and end > start:
 
+        candidate = text[start:end + 1]
 
-    if match:
+        return json.loads(candidate)
 
-        try:
-
-            return json.loads(
-                match.group(0)
-            )
-
-        except Exception:
-
-            pass
+    raise ValueError("AI did not return valid JSON")
 
 
-    raise ValueError(
-        "AI did not return valid JSON."
-    )
+# ============================================================
+# NORMALIZATION
+# ============================================================
 
-
-# =========================================================
-# SAFE INTEGER
-# =========================================================
-
-def safe_int(
-    value,
-    default=0
-):
+def safe_int(value, default=0):
 
     try:
-
-        return int(
-            float(value)
-        )
-
+        return int(float(value))
     except Exception:
-
         return default
 
 
-# =========================================================
-# NORMALIZE PROBABILITIES
-# =========================================================
+def safe_float(value):
 
-def normalize_probabilities(
-    long_probability,
-    short_probability
-):
+    try:
+        return float(value)
+    except Exception:
+        return None
 
-    long_probability = max(
-        0,
-        min(
-            100,
-            long_probability
-        )
-    )
 
-    short_probability = max(
-        0,
-        min(
-            100,
-            short_probability
-        )
-    )
+def normalize_analysis(data):
 
+    if not isinstance(data, dict):
+        raise ValueError("Invalid AI response")
 
-    total = (
-        long_probability
-        + short_probability
-    )
+    fields = {
+        "symbol": "UNKNOWN",
+        "market": "BINANCE FUTURES",
+        "timeframe": "UNKNOWN",
+        "signal": "NO TRADE",
 
+        "trend": "Unclear",
+        "market_structure": "Unclear",
+        "candle_psychology": "Unclear",
+        "momentum": "Unclear",
 
-    if total == 100:
+        "support": "Unclear",
+        "support_zone": "UNKNOWN",
 
-        return (
-            long_probability,
-            short_probability
-        )
+        "resistance": "Unclear",
+        "resistance_zone": "UNKNOWN",
 
+        "breakout": "Unclear",
+        "trap": "Unclear",
 
-    if total <= 0:
+        "continuation": "Unclear",
+        "reversal": "Unclear",
+        "exhaustion": "Unclear",
 
-        return 50, 50
+        "volume": "Unclear",
+        "order_book": "Unclear",
+        "long_short_ratio": "Unavailable",
 
+        "mtf_alignment": "Insufficient",
+        "data_quality": "Poor",
 
-    long_probability = round(
-        (
-            long_probability
-            / total
-        ) * 100
-    )
+        "risk": "High",
 
+        "entry_zone": "UNKNOWN",
+        "stop_loss": "UNKNOWN",
+        "take_profit": "UNKNOWN",
 
-    short_probability = (
-        100 - long_probability
-    )
+        "reason": ""
+    }
 
+    for key, default in fields.items():
 
-    return (
-        long_probability,
-        short_probability
-    )
+        if key not in data:
+            data[key] = default
 
+    # Normalize probabilities
+    long_p = safe_int(data.get("long_probability"), 0)
+    short_p = safe_int(data.get("short_probability"), 0)
 
-# =========================================================
-# QUALITY GATE
-# =========================================================
+    long_p = max(0, min(100, long_p))
+    short_p = max(0, min(100, short_p))
 
-def quality_gate(
-    data: dict
-) -> dict:
+    total = long_p + short_p
 
-    long_probability = safe_int(
-        data.get(
-            "long_probability",
-            50
-        ),
-        50
-    )
+    if total > 0:
 
-    short_probability = safe_int(
-        data.get(
-            "short_probability",
-            50
-        ),
-        50
-    )
-
-
-    long_probability, short_probability = (
-        normalize_probabilities(
-            long_probability,
-            short_probability
-        )
-    )
-
-
-    confidence = max(
-        long_probability,
-        short_probability
-    )
-
-
-    trend = str(
-        data.get(
-            "trend",
-            "Unclear"
-        )
-    ).lower()
-
-
-    structure = str(
-        data.get(
-            "market_structure",
-            "Unclear"
-        )
-    ).lower()
-
-
-    candle = str(
-        data.get(
-            "candle_psychology",
-            "Unclear"
-        )
-    ).lower()
-
-
-    momentum = str(
-        data.get(
-            "momentum",
-            "Unclear"
-        )
-    ).lower()
-
-
-    confirmation = str(
-        data.get(
-            "confirmation",
-            "Unclear"
-        )
-    ).lower()
-
-
-    risk = str(
-        data.get(
-            "risk",
-            "High"
-        )
-    ).lower()
-
-
-    breakout = str(
-        data.get(
-            "breakout",
-            "Unclear"
-        )
-    ).lower()
-
-
-    trap = str(
-        data.get(
-            "trap",
-            "Unclear"
-        )
-    ).lower()
-
-
-    exhaustion = str(
-        data.get(
-            "exhaustion",
-            "Unclear"
-        )
-    ).lower()
-
-
-    reversal = str(
-        data.get(
-            "reversal",
-            "Unclear"
-        )
-    ).lower()
-
-
-    force_no_trade = False
-
-
-    # -----------------------------------------------------
-    # CONFIDENCE
-    # -----------------------------------------------------
-
-    if confidence < MIN_CONFIDENCE:
-
-        force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # CONFIRMATION
-    # -----------------------------------------------------
-
-    if confirmation in [
-        "weak",
-        "unclear"
-    ]:
-
-        force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # RISK
-    # -----------------------------------------------------
-
-    if risk == "high":
-
-        force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # STRUCTURE
-    # -----------------------------------------------------
-
-    if structure == "unclear":
-
-        force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # CANDLE
-    # -----------------------------------------------------
-
-    if candle in [
-        "mixed",
-        "unclear"
-    ]:
-
-        force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # MOMENTUM
-    # -----------------------------------------------------
-
-    if momentum == "unclear":
-
-        force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # EXHAUSTION
-    # -----------------------------------------------------
-
-    if exhaustion == "high":
-
-        force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # FALSE BREAKOUT
-    # -----------------------------------------------------
-
-    if breakout == "false breakout":
-
-        force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # TRAP
-    # -----------------------------------------------------
-
-    if trap == "possible trap":
-
-        force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # REVERSAL
-    # -----------------------------------------------------
-
-    if reversal == "likely":
-
-        if confirmation != "strong":
-
-            force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # DETERMINE CANDIDATE
-    # -----------------------------------------------------
-
-    if long_probability > short_probability:
-
-        candidate = "LONG"
-
-    elif short_probability > long_probability:
-
-        candidate = "SHORT"
+        long_p = round((long_p / total) * 100)
+        short_p = 100 - long_p
 
     else:
 
-        candidate = "NO TRADE"
+        long_p = 0
+        short_p = 0
 
+    data["long_probability"] = long_p
+    data["short_probability"] = short_p
 
-    # -----------------------------------------------------
-    # DIRECTION CONSISTENCY
-    # -----------------------------------------------------
-
-    if candidate == "LONG":
-
-        if trend == "bearish":
-
-            force_no_trade = True
-
-        if candle == "bearish":
-
-            force_no_trade = True
-
-
-    elif candidate == "SHORT":
-
-        if trend == "bullish":
-
-            force_no_trade = True
-
-        if candle == "bullish":
-
-            force_no_trade = True
-
-
-    # -----------------------------------------------------
-    # FINAL SIGNAL
-    # -----------------------------------------------------
-
-    if force_no_trade:
-
-        final_signal = "NO TRADE"
-
-    else:
-
-        if (
-            candidate == "LONG"
-            and long_probability >= MIN_CONFIDENCE
-        ):
-
-            final_signal = "LONG"
-
-        elif (
-            candidate == "SHORT"
-            and short_probability >= MIN_CONFIDENCE
-        ):
-
-            final_signal = "SHORT"
-
-        else:
-
-            final_signal = "NO TRADE"
-
-
-    data["long_probability"] = (
-        long_probability
+    data["confidence"] = max(
+        0,
+        min(
+            100,
+            safe_int(data.get("confidence"), 0)
+        )
     )
 
-    data["short_probability"] = (
-        short_probability
-    )
+    signal = str(data.get("signal", "NO TRADE")).upper()
 
-    data["confidence"] = confidence
+    if signal not in ["LONG", "SHORT", "NO TRADE"]:
 
-    data["signal"] = final_signal
+        signal = "NO TRADE"
 
+    data["signal"] = signal
+
+    rr = safe_float(data.get("risk_reward"))
+
+    if rr is not None and rr < 0:
+        rr = None
+
+    data["risk_reward"] = rr
+
+    if not isinstance(data.get("evidence"), list):
+        data["evidence"] = []
+
+    if not isinstance(data.get("timeframe_views"), list):
+        data["timeframe_views"] = []
 
     return data
 
 
-# =========================================================
-# HISTORY CONTEXT
-# =========================================================
+# ============================================================
+# MULTI-TIMEFRAME CHECK
+# ============================================================
 
-def build_history_context(
-    chat_id
-):
+def calculate_mtf_alignment(data):
 
-    history = chat_history.get(
-        chat_id
-    )
+    views = data.get("timeframe_views", [])
 
+    biases = []
 
-    if not history:
+    for view in views:
 
-        return (
-            "No previous analysis."
+        if not isinstance(view, dict):
+            continue
+
+        bias = str(view.get("bias", "")).strip()
+
+        if bias in ["Bullish", "Bearish"]:
+            biases.append(bias)
+
+    if len(biases) <= 1:
+
+        return data.get(
+            "mtf_alignment",
+            "Single timeframe"
         )
 
+    if all(x == "Bullish" for x in biases):
 
-    lines = [
-        "Previous analysis context:"
-    ]
+        return "Aligned Bullish"
 
+    if all(x == "Bearish" for x in biases):
 
-    for item in history:
+        return "Aligned Bearish"
 
-        lines.append(
-            item
-        )
+    return "Mixed"
 
 
-    return "\n".join(
-        lines
-    )
+# ============================================================
+# SETUP SCORE
+# ============================================================
 
+def calculate_setup_score(data):
 
-# =========================================================
-# SAVE HISTORY
-# =========================================================
+    signal = data["signal"]
 
-def save_history(
-    chat_id,
-    data
-):
+    # Candidate direction based on probabilities
+    if signal == "NO TRADE":
 
-    summary = (
-        f"{data.get('symbol', 'UNKNOWN')} | "
-        f"{data.get('timeframe', 'UNKNOWN')} | "
-        f"Signal={data['signal']} | "
-        f"LONG={data['long_probability']}% | "
-        f"SHORT={data['short_probability']}% | "
-        f"Confidence={data['confidence']}% | "
-        f"Trend={data.get('trend')} | "
-        f"Risk={data.get('risk')}"
-    )
+        if data["long_probability"] > data["short_probability"]:
+            direction = "LONG"
 
+        elif data["short_probability"] > data["long_probability"]:
+            direction = "SHORT"
 
-    chat_history[
-        chat_id
-    ].append(summary)
-
-
-# =========================================================
-# FORMAT TELEGRAM MESSAGE
-# =========================================================
-
-def format_result(
-    data: dict
-) -> str:
-
-    signal = data[
-        "signal"
-    ]
-
-
-    if signal == "LONG":
-
-        icon = "🟢"
-
-    elif signal == "SHORT":
-
-        icon = "🔴"
+        else:
+            return 0
 
     else:
 
-        icon = "⚪"
+        direction = signal
+
+    score = 0
+
+    trend = data.get("trend")
+    structure = data.get("market_structure")
+    candle = data.get("candle_psychology")
+    momentum = data.get("momentum")
+
+    support = data.get("support")
+    resistance = data.get("resistance")
+
+    breakout = data.get("breakout")
+    trap = data.get("trap")
+
+    exhaustion = data.get("exhaustion")
+    volume = data.get("volume")
+
+    confirmation = data.get("confirmation", "Unclear")
+
+    risk = data.get("risk")
+
+    mtf = calculate_mtf_alignment(data)
+
+    quality = data.get("data_quality")
+
+    # --------------------------------------------------------
+    # DATA QUALITY
+    # --------------------------------------------------------
+
+    if quality == "Good":
+        score += 10
+
+    elif quality == "Fair":
+        score += 5
+
+    # --------------------------------------------------------
+    # STRUCTURE
+    # --------------------------------------------------------
+
+    if structure == "Strong":
+        score += 15
+
+    elif structure == "Moderate":
+        score += 10
+
+    # --------------------------------------------------------
+    # TREND
+    # --------------------------------------------------------
+
+    if direction == "LONG":
+
+        if trend == "Bullish":
+            score += 15
+
+        elif trend == "Range":
+            score += 5
+
+    elif direction == "SHORT":
+
+        if trend == "Bearish":
+            score += 15
+
+        elif trend == "Range":
+            score += 5
+
+    # --------------------------------------------------------
+    # CANDLE PSYCHOLOGY
+    # --------------------------------------------------------
+
+    if direction == "LONG" and candle == "Bullish":
+        score += 15
+
+    elif direction == "SHORT" and candle == "Bearish":
+        score += 15
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    if momentum == "Strong":
+        score += 15
+
+    elif momentum == "Moderate":
+        score += 10
+
+    # --------------------------------------------------------
+    # SUPPORT / RESISTANCE
+    # --------------------------------------------------------
+
+    if direction == "LONG" and support == "Confirmed":
+        score += 10
+
+    if direction == "SHORT" and resistance == "Confirmed":
+        score += 10
+
+    # --------------------------------------------------------
+    # BREAKOUT
+    # --------------------------------------------------------
+
+    if direction == "LONG" and breakout == "Confirmed Up":
+        score += 10
+
+    if direction == "SHORT" and breakout == "Confirmed Down":
+        score += 10
+
+    # --------------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------------
+
+    if volume == "Strong":
+        score += 5
+
+    elif volume == "Normal":
+        score += 3
+
+    # --------------------------------------------------------
+    # CONFIRMATION
+    # --------------------------------------------------------
+
+    if confirmation == "Strong":
+        score += 10
+
+    elif confirmation == "Good":
+        score += 7
+
+    # --------------------------------------------------------
+    # MULTI TIMEFRAME
+    # --------------------------------------------------------
+
+    if direction == "LONG" and mtf == "Aligned Bullish":
+        score += 10
+
+    elif direction == "SHORT" and mtf == "Aligned Bearish":
+        score += 10
+
+    elif mtf == "Single timeframe":
+        score += 5
+
+    # --------------------------------------------------------
+    # PENALTIES
+    # --------------------------------------------------------
+
+    if trap in [
+        "Bull Trap",
+        "Bear Trap",
+        "Possible Trap"
+    ]:
+        score -= 25
+
+    if exhaustion == "High":
+        score -= 20
+
+    elif exhaustion == "Medium":
+        score -= 5
+
+    if risk == "High":
+        score -= 20
+
+    if data.get("data_quality") == "Poor":
+        score -= 20
+
+    if mtf == "Mixed":
+        score -= 25
+
+    score = max(0, min(100, score))
+
+    return score
 
 
-    return (
+# ============================================================
+# STRICT QUALITY GATE
+# ============================================================
 
-        "🤖 BINANCE FUTURES AI\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+def quality_gate(data):
 
-        f"📌 SYMBOL: "
-        f"{data.get('symbol', 'UNKNOWN')}\n"
+    original_signal = data["signal"]
 
-        f"⏱ TIMEFRAME: "
-        f"{data.get('timeframe', 'UNKNOWN')}\n\n"
+    # If AI already says NO TRADE
+    if original_signal == "NO TRADE":
 
-        f"{icon} SIGNAL: "
-        f"{signal}\n\n"
+        data["signal"] = "NO TRADE"
 
-        f"🟢 LONG: "
-        f"{data['long_probability']}%\n"
+        return data
 
-        f"🔴 SHORT: "
-        f"{data['short_probability']}%\n"
+    confidence = data["confidence"]
 
-        f"🎯 CONFIDENCE: "
-        f"{data['confidence']}%\n\n"
+    if confidence < MIN_CONFIDENCE:
 
-        "📊 MARKET STRUCTURE\n"
-
-        f"Trend: "
-        f"{data.get('trend')}\n"
-
-        f"Structure: "
-        f"{data.get('market_structure')}\n"
-
-        f"Momentum: "
-        f"{data.get('momentum')}\n\n"
-
-        "🕯 CANDLE PSYCHOLOGY\n"
-
-        f"{data.get('candle_psychology')}\n\n"
-
-        "📍 SUPPORT / RESISTANCE\n"
-
-        f"Support: "
-        f"{data.get('support')}\n"
-
-        f"Resistance: "
-        f"{data.get('resistance')}\n\n"
-
-        "💥 PRICE ACTION\n"
-
-        f"Breakout: "
-        f"{data.get('breakout')}\n"
-
-        f"Trap: "
-        f"{data.get('trap')}\n"
-
-        f"Continuation: "
-        f"{data.get('continuation')}\n"
-
-        f"Reversal: "
-        f"{data.get('reversal')}\n"
-
-        f"Exhaustion: "
-        f"{data.get('exhaustion')}\n\n"
-
-        "📈 MARKET DATA VISIBLE\n"
-
-        f"Volume: "
-        f"{data.get('volume')}\n"
-
-        f"Order Book: "
-        f"{data.get('order_book')}\n"
-
-        f"Long/Short: "
-        f"{data.get('long_short_ratio')}\n\n"
-
-        "🛡 RISK\n"
-
-        f"Risk: "
-        f"{data.get('risk')}\n"
-
-        f"Confirmation: "
-        f"{data.get('confirmation')}\n\n"
-
-        "🎯 LEVELS\n"
-
-        f"Entry: "
-        f"{data.get('entry_zone')}\n"
-
-        f"Stop Loss: "
-        f"{data.get('stop_loss')}\n"
-
-        f"Take Profit: "
-        f"{data.get('take_profit')}\n\n"
-
-        f"📝 {data.get('reason')}\n\n"
-
-        "⚠️ Screenshot analysis only. "
-        "No guaranteed outcome."
-    )
-
-
-# =========================================================
-# ANALYZE IMAGE
-# =========================================================
-
-def analyze_chart(
-    image_bytes: bytes,
-    chat_id=None
-):
-
-    image_bytes = prepare_image(
-        image_bytes
-    )
-
-
-    image_base64 = base64.b64encode(
-        image_bytes
-    ).decode("utf-8")
-
-
-    history = (
-        build_history_context(
-            chat_id
+        data["signal"] = "NO TRADE"
+        data["reason"] = (
+            f"Confidence below minimum threshold "
+            f"({MIN_CONFIDENCE}%)."
         )
-        if chat_id is not None
-        else "No previous context."
-    )
 
+        return data
+
+    if data.get("data_quality") == "Poor":
+
+        data["signal"] = "NO TRADE"
+        data["reason"] = "Chart data quality is insufficient."
+
+        return data
+
+    if data.get("risk") == "High":
+
+        data["signal"] = "NO TRADE"
+        data["reason"] = "Risk is too high."
+
+        return data
+
+    if data.get("market_structure") in [
+        "Weak",
+        "Unclear"
+    ]:
+
+        data["signal"] = "NO TRADE"
+        data["reason"] = "Market structure is not sufficiently clear."
+
+        return data
+
+    if data.get("candle_psychology") in [
+        "Mixed",
+        "Unclear"
+    ]:
+
+        data["signal"] = "NO TRADE"
+        data["reason"] = "Candle psychology is conflicting or unclear."
+
+        return data
+
+    if data.get("momentum") == "Unclear":
+
+        data["signal"] = "NO TRADE"
+        data["reason"] = "Momentum is unclear."
+
+        return data
+
+    if data.get("exhaustion") == "High":
+
+        data["signal"] = "NO TRADE"
+        data["reason"] = "High exhaustion detected."
+
+        return data
+
+    if data.get("trap") in [
+        "Bull Trap",
+        "Bear Trap",
+        "Possible Trap"
+    ]:
+
+        data["signal"] = "NO TRADE"
+        data["reason"] = "Potential trap detected."
+
+        return data
+
+    if data.get("breakout") == "False Breakout":
+
+        data["signal"] = "NO TRADE"
+        data["reason"] = "False breakout detected."
+
+        return data
+
+    mtf = calculate_mtf_alignment(data)
+
+    if mtf == "Mixed":
+
+        data["signal"] = "NO TRADE"
+        data["reason"] = "Timeframes are conflicting."
+
+        return data
+
+    signal = original_signal
+
+    trend = data.get("trend")
+    candle = data.get("candle_psychology")
+    reversal = data.get("reversal")
+
+    # --------------------------------------------------------
+    # LONG FILTER
+    # --------------------------------------------------------
+
+    if signal == "LONG":
+
+        if trend == "Bearish" and reversal != "Likely":
+
+            data["signal"] = "NO TRADE"
+            data["reason"] = (
+                "LONG conflicts with bearish structure/trend."
+            )
+
+            return data
+
+        if candle != "Bullish":
+
+            data["signal"] = "NO TRADE"
+            data["reason"] = (
+                "LONG lacks bullish candle confirmation."
+            )
+
+            return data
+
+        if data.get("momentum") == "Weak":
+
+            data["signal"] = "NO TRADE"
+            data["reason"] = (
+                "LONG lacks sufficient momentum."
+            )
+
+            return data
+
+    # --------------------------------------------------------
+    # SHORT FILTER
+    # --------------------------------------------------------
+
+    if signal == "SHORT":
+
+        if trend == "Bullish" and reversal != "Likely":
+
+            data["signal"] = "NO TRADE"
+            data["reason"] = (
+                "SHORT conflicts with bullish structure/trend."
+            )
+
+            return data
+
+        if candle != "Bearish":
+
+            data["signal"] = "NO TRADE"
+            data["reason"] = (
+                "SHORT lacks bearish candle confirmation."
+            )
+
+            return data
+
+        if data.get("momentum") == "Weak":
+
+            data["signal"] = "NO TRADE"
+            data["reason"] = (
+                "SHORT lacks sufficient momentum."
+            )
+
+            return data
+
+    # --------------------------------------------------------
+    # SETUP SCORE
+    # --------------------------------------------------------
+
+    setup_score = calculate_setup_score(data)
+
+    data["setup_score"] = setup_score
+
+    if setup_score < MIN_SETUP_SCORE:
+
+        data["signal"] = "NO TRADE"
+
+        data["reason"] = (
+            f"Setup score {setup_score}/100 is below "
+            f"the minimum {MIN_SETUP_SCORE}/100."
+        )
+
+        return data
+
+    return data
+
+
+# ============================================================
+# OPENAI ANALYSIS
+# ============================================================
+
+def analyze_images(images):
+
+    """
+    images:
+        [
+            ("5m", bytes),
+            ("15m", bytes),
+            ("1h", bytes)
+        ]
+    """
+
+    prepared = []
+
+    for label, raw in images:
+
+        image = prepare_image(raw)
+
+        prepared.append(
+            (
+                label,
+                image
+            )
+        )
+
+    labels_text = []
+
+    for index, (label, _) in enumerate(prepared, start=1):
+
+        labels_text.append(
+            f"Image {index}: timeframe label = {label}"
+        )
 
     user_prompt = f"""
-Analyze the ENTIRE Binance Futures screenshot.
+Analyze the supplied Binance Futures chart screenshot(s).
 
-The current screenshot is the primary source of truth.
+{chr(10).join(labels_text)}
 
-Previous analysis is only historical context.
-Do not assume previous predictions were correct.
+IMPORTANT:
 
-{history}
+- Use only visible evidence.
+- Do not invent hidden data.
+- If volume/order book/long-short ratio is not visible, mark it Unclear/Unavailable.
+- Analyze the full visible candle history, not just the newest candle.
+- Give special attention to candle psychology, market psychology,
+  trader behavior, liquidity sweeps, traps, exhaustion and continuation.
+- Compare timeframes when multiple screenshots are supplied.
+- Prefer NO TRADE when evidence conflicts.
+- Never guarantee profit.
 
-Identify the trading pair and timeframe if visible.
-
-Analyze all visible chart information.
-
-Return ONLY the required JSON.
+Return ONLY JSON according to the required schema.
 """
 
+    content = [
+        {
+            "type": "input_text",
+            "text": user_prompt
+        }
+    ]
+
+    for label, image in prepared:
+
+        encoded = image_to_base64(image)
+
+        content.append(
+            {
+                "type": "input_text",
+                "text": f"Chart image timeframe label: {label}"
+            }
+        )
+
+        content.append(
+            {
+                "type": "input_image",
+                "image_url": (
+                    "data:image/jpeg;base64,"
+                    + encoded
+                ),
+                "detail": "high"
+            }
+        )
 
     response = client.responses.create(
-
         model=OPENAI_MODEL,
 
         input=[
-
             {
                 "role": "system",
-
                 "content": [
-
                     {
                         "type": "input_text",
-
                         "text": SYSTEM_PROMPT
-
                     }
-
                 ]
-
             },
-
             {
                 "role": "user",
-
-                "content": [
-
-                    {
-                        "type": "input_text",
-
-                        "text": user_prompt
-
-                    },
-
-                    {
-                        "type": "input_image",
-
-                        "image_url": (
-                            "data:image/jpeg;base64,"
-                            + image_base64
-                        ),
-
-                        "detail": "high"
-                    }
-
-                ]
-
+                "content": content
             }
-
         ]
-
     )
 
+    raw_text = response.output_text
 
-    raw_result = (
-        response.output_text.strip()
-    )
+    data = extract_json(raw_text)
 
+    data = normalize_analysis(data)
 
-    print(
-        "AI RESULT:",
-        raw_result
-    )
+    # Determine MTF status locally too
+    data["mtf_alignment"] = calculate_mtf_alignment(data)
 
+    # Apply local setup score
+    data["setup_score"] = calculate_setup_score(data)
 
-    data = extract_json(
-        raw_result
-    )
+    # Apply strict final filter
+    data = quality_gate(data)
 
-
-    data = quality_gate(
-        data
-    )
+    return data
 
 
-    if chat_id is not None:
+# ============================================================
+# DATABASE RECORDING
+# ============================================================
 
-        save_history(
-            chat_id,
-            data
+def record_signal(chat_id, data):
+
+    with db_lock:
+
+        conn = get_db()
+
+        cursor = conn.execute(
+            """
+            INSERT INTO signals (
+                chat_id,
+                created_at,
+                symbol,
+                timeframe,
+                signal,
+                long_probability,
+                short_probability,
+                confidence,
+                setup_score,
+                risk,
+                entry_zone,
+                stop_loss,
+                take_profit,
+                risk_reward,
+                reason,
+                outcome
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                datetime.now(timezone.utc).isoformat(),
+
+                data.get("symbol"),
+                data.get("timeframe"),
+
+                data.get("signal"),
+
+                data.get("long_probability"),
+                data.get("short_probability"),
+
+                data.get("confidence"),
+                data.get("setup_score"),
+
+                data.get("risk"),
+
+                data.get("entry_zone"),
+                data.get("stop_loss"),
+                data.get("take_profit"),
+
+                data.get("risk_reward"),
+
+                data.get("reason"),
+
+                None
+            )
         )
 
+        signal_id = cursor.lastrowid
 
-    return format_result(
-        data
-    )
+        conn.commit()
+        conn.close()
+
+    last_signal_id[chat_id] = signal_id
+
+    return signal_id
 
 
-# =========================================================
-# START COMMAND
-# =========================================================
+# ============================================================
+# FORMAT TELEGRAM RESULT
+# ============================================================
 
-async def start(
+def format_result(data, signal_id):
+
+    signal = data["signal"]
+
+    if signal == "LONG":
+        emoji = "🟢"
+    elif signal == "SHORT":
+        emoji = "🔴"
+    else:
+        emoji = "⚪"
+
+    rr = data.get("risk_reward")
+
+    if rr is None:
+        rr_text = "UNKNOWN"
+    else:
+        rr_text = f"{rr:.2f}"
+
+    evidence = data.get("evidence", [])
+
+    evidence_lines = []
+
+    for item in evidence[:3]:
+
+        evidence_lines.append(
+            f"• {str(item)[:180]}"
+        )
+
+    if not evidence_lines:
+        evidence_lines.append(
+            "• No additional evidence provided."
+        )
+
+    text = f"""
+{emoji} BINANCE FUTURES AI
+
+━━━━━━━━━━━━━━━━
+SIGNAL: {signal}
+━━━━━━━━━━━━━━━━
+
+Symbol: {data.get("symbol")}
+Timeframe: {data.get("timeframe")}
+
+LONG: {data.get("long_probability")}%
+SHORT: {data.get("short_probability")}%
+
+Confidence: {data.get("confidence")}%
+Setup Score: {data.get("setup_score")}/100
+
+MTF: {data.get("mtf_alignment")}
+Data Quality: {data.get("data_quality")}
+
+━━━━━━━━━━━━━━━━
+MARKET ANALYSIS
+━━━━━━━━━━━━━━━━
+
+Trend: {data.get("trend")}
+Structure: {data.get("market_structure")}
+Momentum: {data.get("momentum")}
+Candle Psychology: {data.get("candle_psychology")}
+
+Support: {data.get("support")}
+Resistance: {data.get("resistance")}
+
+Breakout: {data.get("breakout")}
+Trap: {data.get("trap")}
+Exhaustion: {data.get("exhaustion")}
+
+Volume: {data.get("volume")}
+Order Book: {data.get("order_book")}
+Long/Short: {data.get("long_short_ratio")}
+
+Risk: {data.get("risk")}
+
+━━━━━━━━━━━━━━━━
+TRADE LEVELS
+━━━━━━━━━━━━━━━━
+
+Entry: {data.get("entry_zone")}
+SL: {data.get("stop_loss")}
+TP: {data.get("take_profit")}
+R:R: {rr_text}
+
+━━━━━━━━━━━━━━━━
+MARKET PSYCHOLOGY
+━━━━━━━━━━━━━━━━
+
+{chr(10).join(evidence_lines)}
+
+━━━━━━━━━━━━━━━━
+REASON
+━━━━━━━━━━━━━━━━
+
+{data.get("reason")}
+
+━━━━━━━━━━━━━━━━
+Signal ID: #{signal_id}
+
+Paper/demo testing recommended.
+Confidence is NOT a guaranteed win probability.
+"""
+
+    return text.strip()
+
+
+# ============================================================
+# /START
+# ============================================================
+
+async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
     await update.message.reply_text(
+        """
+🤖 Binance Futures AI Assistant V3
 
-        "🤖 BINANCE FUTURES AI\n\n"
+Send a Binance Futures chart screenshot.
 
-        "Send me a Binance Futures chart "
-        "screenshot.\n\n"
+The AI analyzes:
 
-        "I will analyze:\n"
+• Candle Psychology
+• Market Psychology
+• Trader Behavior
+• Market Structure
+• Support / Resistance
+• Momentum
+• Volume
+• Breakout / Fake Breakout
+• Liquidity Sweep
+• Trap
+• Exhaustion
+• Multi-Timeframe Alignment
+• Risk / Reward
 
-        "🕯 Candle Psychology\n"
-        "📊 Market Structure\n"
-        "📈 Momentum\n"
-        "📍 Support / Resistance\n"
-        "💥 Breakout / Fake Breakout\n"
-        "🪤 Trap Psychology\n"
-        "🥵 Exhaustion\n"
-        "📊 Volume\n"
-        "📖 Order Book if visible\n"
-        "⚖️ Long/Short ratio if visible\n\n"
+Commands:
 
-        f"🎯 Minimum confidence: "
-        f"{MIN_CONFIDENCE}%\n\n"
+/multi - Multi-timeframe mode
+/analyze - Analyze queued charts
+/single - Return to single screenshot mode
+/history - Signal history
+/stats - Performance statistics
+/result WIN - Mark latest trade WIN
+/result LOSS - Mark latest trade LOSS
+/result INVALID - Mark latest trade INVALID
+/status - Bot status
+/clear - Clear pending screenshots
+/help - Help
 
-        "Weak setup → NO TRADE"
+QUALITY > QUANTITY
+
+If evidence is weak or conflicting:
+NO TRADE
+""".strip()
     )
 
 
-# =========================================================
-# HELP COMMAND
-# =========================================================
+# ============================================================
+# /HELP
+# ============================================================
 
 async def help_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    await update.message.reply_text(
-
-        "📖 BINANCE FUTURES AI\n\n"
-
-        "/start - Start bot\n"
-        "/status - Bot status\n"
-        "/clear - Clear analysis memory\n"
-        "/help - Help\n\n"
-
-        "Send a clear Binance Futures "
-        "chart screenshot for analysis."
-    )
+    await start_command(update, context)
 
 
-# =========================================================
-# STATUS COMMAND
-# =========================================================
+# ============================================================
+# /STATUS
+# ============================================================
 
 async def status_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    chat_id = update.effective_chat.id
+
+    queued = len(pending_multi.get(chat_id, {}))
+
     await update.message.reply_text(
+        f"""
+🟢 BOT STATUS
 
-        "🟢 BINANCE FUTURES AI ONLINE\n\n"
+Version: V3 Unified
+Mode: Screenshot Analysis
+Model: {OPENAI_MODEL}
 
-        f"Model: {OPENAI_MODEL}\n"
+Minimum Confidence: {MIN_CONFIDENCE}%
+Minimum Setup Score: {MIN_SETUP_SCORE}/100
 
-        f"Confidence threshold: "
-        f"{MIN_CONFIDENCE}%\n"
+Multi-Timeframe Mode:
+{"ON" if multi_mode[chat_id] else "OFF"}
 
-        f"History: "
-        f"{MAX_HISTORY} analyses\n\n"
+Queued Images: {queued}
 
-        "Mode: Screenshot Analysis\n"
-        "Trading: DISABLED\n"
-        "Quality Filter: ENABLED"
+Order Execution:
+OFF
+
+This bot generates analysis/signals only.
+""".strip()
     )
 
 
-# =========================================================
-# CLEAR COMMAND
-# =========================================================
+# ============================================================
+# /MULTI
+# ============================================================
+
+async def multi_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_id = update.effective_chat.id
+
+    pending_multi[chat_id].clear()
+
+    multi_mode[chat_id] = True
+
+    await update.message.reply_text(
+        """
+📊 MULTI-TIMEFRAME MODE ON
+
+Send up to 3 screenshots.
+
+Recommended:
+
+1️⃣ 5m
+2️⃣ 15m
+3️⃣ 1h
+
+You can add the timeframe in the caption:
+
+5m
+15m
+1h
+
+After sending them:
+
+/analyze
+
+The AI will compare the timeframes.
+
+If they conflict → NO TRADE.
+""".strip()
+    )
+
+
+# ============================================================
+# /SINGLE
+# ============================================================
+
+async def single_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_id = update.effective_chat.id
+
+    pending_multi[chat_id].clear()
+
+    multi_mode[chat_id] = False
+
+    await update.message.reply_text(
+        "📷 Single screenshot mode ON."
+    )
+
+
+# ============================================================
+# /ANALYZE
+# ============================================================
+
+async def analyze_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_id = update.effective_chat.id
+
+    items = pending_multi.get(chat_id, {})
+
+    if not items:
+
+        await update.message.reply_text(
+            "No queued screenshots. Use /multi first."
+        )
+
+        return
+
+    images = list(items.items())
+
+    pending_multi[chat_id].clear()
+
+    multi_mode[chat_id] = False
+
+    await run_analysis(
+        update,
+        images
+    )
+
+
+# ============================================================
+# RUN ANALYSIS
+# ============================================================
+
+async def run_analysis(
+    update: Update,
+    images
+):
+
+    chat_id = update.effective_chat.id
+
+    now = time.time()
+
+    if now - last_analysis_time[chat_id] < COOLDOWN_SECONDS:
+
+        await update.message.reply_text(
+            "⏳ Please wait a few seconds before another analysis."
+        )
+
+        return
+
+    last_analysis_time[chat_id] = now
+
+    if len(images) > MAX_IMAGES:
+
+        images = images[:MAX_IMAGES]
+
+    await update.message.reply_text(
+        "🔎 Analyzing chart psychology + market structure..."
+    )
+
+    try:
+
+        data = await asyncio.to_thread(
+            analyze_images,
+            images
+        )
+
+        signal_id = record_signal(
+            chat_id,
+            data
+        )
+
+        result = format_result(
+            data,
+            signal_id
+        )
+
+        await update.message.reply_text(
+            result
+        )
+
+    except Exception as e:
+
+        print("ANALYSIS ERROR:", repr(e))
+
+        await update.message.reply_text(
+            """
+❌ Analysis failed.
+
+Possible reasons:
+
+• OpenAI API error
+• Invalid image
+• Temporary server issue
+• AI returned invalid JSON
+
+Please try the screenshot again.
+""".strip()
+        )
+
+
+# ============================================================
+# PHOTO HANDLER
+# ============================================================
+
+async def photo_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_id = update.effective_chat.id
+
+    if not update.message.photo:
+
+        return
+
+    photo = update.message.photo[-1]
+
+    telegram_file = await photo.get_file()
+
+    image_bytes = await telegram_file.download_as_bytearray()
+
+    image_bytes = bytes(image_bytes)
+
+    caption = update.message.caption or ""
+
+    timeframe = extract_timeframe(caption)
+
+    # --------------------------------------------------------
+    # MULTI MODE
+    # --------------------------------------------------------
+
+    if multi_mode[chat_id]:
+
+        if len(pending_multi[chat_id]) >= MAX_IMAGES:
+
+            await update.message.reply_text(
+                f"Maximum {MAX_IMAGES} screenshots queued."
+            )
+
+            return
+
+        if timeframe is None:
+
+            timeframe = (
+                f"image_{len(pending_multi[chat_id]) + 1}"
+            )
+
+        pending_multi[chat_id][timeframe] = image_bytes
+
+        await update.message.reply_text(
+            f"""
+📥 Screenshot saved
+
+Timeframe: {timeframe}
+Queued: {len(pending_multi[chat_id])}/{MAX_IMAGES}
+
+Send another screenshot or use:
+
+/analyze
+""".strip()
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # SINGLE MODE
+    # --------------------------------------------------------
+
+    label = timeframe or "single"
+
+    await run_analysis(
+        update,
+        [
+            (
+                label,
+                image_bytes
+            )
+        ]
+    )
+
+
+# ============================================================
+# /RESULT
+# ============================================================
+
+async def result_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+
+        await update.message.reply_text(
+            "Usage:\n/result WIN\n/result LOSS\n/result INVALID"
+        )
+
+        return
+
+    outcome = context.args[0].upper()
+
+    if outcome not in [
+        "WIN",
+        "LOSS",
+        "INVALID"
+    ]:
+
+        await update.message.reply_text(
+            "Use WIN, LOSS or INVALID."
+        )
+
+        return
+
+    with db_lock:
+
+        conn = get_db()
+
+        row = conn.execute(
+            """
+            SELECT id, signal
+            FROM signals
+            WHERE chat_id = ?
+              AND signal IN ('LONG', 'SHORT')
+              AND outcome IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id,)
+        ).fetchone()
+
+        if not row:
+
+            conn.close()
+
+            await update.message.reply_text(
+                "No unresolved LONG/SHORT signal found."
+            )
+
+            return
+
+        conn.execute(
+            """
+            UPDATE signals
+            SET outcome = ?
+            WHERE id = ?
+            """,
+            (
+                outcome,
+                row["id"]
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+    await update.message.reply_text(
+        f"✅ Signal #{row['id']} marked as {outcome}."
+    )
+
+
+# ============================================================
+# /STATS
+# ============================================================
+
+async def stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_id = update.effective_chat.id
+
+    with db_lock:
+
+        conn = get_db()
+
+        rows = conn.execute(
+            """
+            SELECT outcome, COUNT(*) AS count
+            FROM signals
+            WHERE chat_id = ?
+              AND signal IN ('LONG', 'SHORT')
+              AND outcome IS NOT NULL
+            GROUP BY outcome
+            """,
+            (chat_id,)
+        ).fetchall()
+
+        conn.close()
+
+    wins = 0
+    losses = 0
+    invalid = 0
+
+    for row in rows:
+
+        if row["outcome"] == "WIN":
+            wins = row["count"]
+
+        elif row["outcome"] == "LOSS":
+            losses = row["count"]
+
+        elif row["outcome"] == "INVALID":
+            invalid = row["count"]
+
+    decided = wins + losses
+
+    if decided > 0:
+        win_rate = wins / decided * 100
+    else:
+        win_rate = 0
+
+    await update.message.reply_text(
+        f"""
+📊 PAPER PERFORMANCE
+
+WIN: {wins}
+LOSS: {losses}
+INVALID: {invalid}
+
+Decided Trades: {decided}
+
+Recorded Win Rate:
+{win_rate:.2f}%
+
+This is based only on manually recorded results.
+It is NOT a guarantee of future performance.
+""".strip()
+    )
+
+
+# ============================================================
+# /HISTORY
+# ============================================================
+
+async def history_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    chat_id = update.effective_chat.id
+
+    with db_lock:
+
+        conn = get_db()
+
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                created_at,
+                symbol,
+                timeframe,
+                signal,
+                confidence,
+                setup_score,
+                outcome
+            FROM signals
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT 10
+            """,
+            (chat_id,)
+        ).fetchall()
+
+        conn.close()
+
+    if not rows:
+
+        await update.message.reply_text(
+            "No signal history yet."
+        )
+
+        return
+
+    lines = [
+        "📜 LAST 10 SIGNALS",
+        ""
+    ]
+
+    for row in rows:
+
+        outcome = row["outcome"] or "-"
+
+        lines.append(
+            f"#{row['id']} | "
+            f"{row['symbol']} | "
+            f"{row['timeframe']} | "
+            f"{row['signal']} | "
+            f"C:{row['confidence']}% | "
+            f"S:{row['setup_score']} | "
+            f"{outcome}"
+        )
+
+    await update.message.reply_text(
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# /CLEAR
+# ============================================================
 
 async def clear_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if not update.effective_chat:
+    chat_id = update.effective_chat.id
 
-        return
+    pending_multi[chat_id].clear()
 
-
-    chat_id = (
-        update.effective_chat.id
-    )
-
-
-    chat_history.pop(
-        chat_id,
-        None
-    )
-
+    multi_mode[chat_id] = False
 
     await update.message.reply_text(
-        "🧹 Analysis history cleared."
+        "🧹 Pending screenshots cleared."
     )
 
 
-# =========================================================
-# PHOTO HANDLER
-# =========================================================
-
-async def handle_photo(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.message:
-        return
-
-
-    if not update.message.photo:
-        return
-
-
-    if not update.effective_chat:
-        return
-
-
-    chat_id = (
-        update.effective_chat.id
-    )
-
-
-    status_message = (
-        await update.message.reply_text(
-
-            "🔍 Reading Binance chart...\n\n"
-
-            "🕯 Candle Psychology\n"
-            "📊 Market Structure\n"
-            "📍 Support / Resistance\n"
-            "📈 Momentum\n"
-            "🪤 Trap Detection\n"
-            "🛡 Risk Filter"
-        )
-    )
-
-
-    try:
-
-        photo = (
-            update.message.photo[-1]
-        )
-
-
-        telegram_file = (
-            await photo.get_file()
-        )
-
-
-        image_bytes = bytes(
-
-            await telegram_file.download_as_bytearray()
-
-        )
-
-
-        result = analyze_chart(
-
-            image_bytes,
-
-            chat_id
-
-        )
-
-
-        await status_message.edit_text(
-            result
-        )
-
-
-    except Exception as error:
-
-        print(
-            "ANALYSIS ERROR:",
-            repr(error)
-        )
-
-
-        await status_message.edit_text(
-
-            "❌ Analysis failed.\n\n"
-
-            "Please send a clear Binance Futures "
-            "screenshot again."
-        )
-
-
-# =========================================================
-# TEXT HANDLER
-# =========================================================
-
-async def handle_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not update.message:
-        return
-
-
-    await update.message.reply_text(
-
-        "📊 Send a Binance Futures "
-        "chart screenshot.\n\n"
-
-        "/help\n"
-        "/status\n"
-        "/clear"
-    )
-
-
-# =========================================================
+# ============================================================
 # ERROR HANDLER
-# =========================================================
+# ============================================================
 
 async def error_handler(
     update: object,
@@ -1746,184 +2062,121 @@ async def error_handler(
 ):
 
     print(
-        "TELEGRAM ERROR:",
+        "Telegram error:",
         repr(context.error)
     )
 
 
-# =========================================================
+# ============================================================
 # MAIN
-# =========================================================
+# ============================================================
 
 def main():
 
-    print(
-        "=========================================="
-    )
+    init_db()
 
-    print(
-        "      BINANCE FUTURES AI ASSISTANT"
-    )
-
-    print(
-        "=========================================="
-    )
-
-    print(
-        f"MODEL: {OPENAI_MODEL}"
-    )
-
-    print(
-        f"CONFIDENCE: {MIN_CONFIDENCE}%"
-    )
-
-    print(
-        "MODE: SCREENSHOT ANALYSIS"
-    )
-
-    print(
-        "TRADING: DISABLED"
-    )
-
-
-    # -----------------------------------------------------
-    # RENDER SERVER
-    # -----------------------------------------------------
-
-    server_thread = threading.Thread(
-
-        target=run_web_server,
-
+    flask_thread = threading.Thread(
+        target=run_flask,
         daemon=True
-
     )
 
-    server_thread.start()
+    flask_thread.start()
 
-
-    # -----------------------------------------------------
-    # TELEGRAM
-    # -----------------------------------------------------
-
-    telegram_app = (
-
+    application = (
         Application.builder()
-
         .token(BOT_TOKEN)
-
         .build()
-
     )
 
-
-    # -----------------------------------------------------
-    # COMMANDS
-    # -----------------------------------------------------
-
-    telegram_app.add_handler(
-
+    application.add_handler(
         CommandHandler(
             "start",
-            start
+            start_command
         )
-
     )
 
-
-    telegram_app.add_handler(
-
+    application.add_handler(
         CommandHandler(
             "help",
             help_command
         )
-
     )
 
-
-    telegram_app.add_handler(
-
+    application.add_handler(
         CommandHandler(
             "status",
             status_command
         )
-
     )
 
+    application.add_handler(
+        CommandHandler(
+            "multi",
+            multi_command
+        )
+    )
 
-    telegram_app.add_handler(
+    application.add_handler(
+        CommandHandler(
+            "single",
+            single_command
+        )
+    )
 
+    application.add_handler(
+        CommandHandler(
+            "analyze",
+            analyze_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "result",
+            result_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "stats",
+            stats_command
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "history",
+            history_command
+        )
+    )
+
+    application.add_handler(
         CommandHandler(
             "clear",
             clear_command
         )
-
     )
 
-
-    # -----------------------------------------------------
-    # PHOTO
-    # -----------------------------------------------------
-
-    telegram_app.add_handler(
-
+    application.add_handler(
         MessageHandler(
-
             filters.PHOTO,
-
-            handle_photo
-
+            photo_handler
         )
-
     )
 
-
-    # -----------------------------------------------------
-    # TEXT
-    # -----------------------------------------------------
-
-    telegram_app.add_handler(
-
-        MessageHandler(
-
-            filters.TEXT
-            & ~filters.COMMAND,
-
-            handle_text
-
-        )
-
-    )
-
-
-    # -----------------------------------------------------
-    # ERRORS
-    # -----------------------------------------------------
-
-    telegram_app.add_error_handler(
+    application.add_error_handler(
         error_handler
     )
 
-
     print(
-        "Telegram bot started."
+        "🚀 Binance Futures AI Assistant V3 started"
     )
 
-    print(
-        "BINANCE FUTURES AI is ready."
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
     )
 
-
-    telegram_app.run_polling(
-
-        drop_pending_updates=True
-
-    )
-
-
-# =========================================================
-# RUN
-# =========================================================
 
 if __name__ == "__main__":
-
     main()
