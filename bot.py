@@ -36,7 +36,20 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # =========================================================
 
 app = Flask(__name__)
+# DASHBOARD DATA
 
+dashboard_lock = threading.Lock()
+
+latest_signal = {
+    "market": "EUR/USD OTC",
+    "signal": "WAITING",
+    "up": None,
+    "down": None,
+    "confidence": None,
+    "trend": "Waiting",
+    "momentum": "Waiting",
+    "updated": "No analysis yet"
+}
 
 @app.get("/")
 def home():
