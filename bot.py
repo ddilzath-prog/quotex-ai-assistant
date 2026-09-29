@@ -53,10 +53,125 @@ latest_signal = {
 
 @app.get("/")
 def home():
-    return jsonify({
-        "status": "online",
-        "bot": "Quotex AI Assistant"
-    })
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Quotex AI Dashboard</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                background: #090909;
+                color: white;
+                font-family: Arial, sans-serif;
+                padding: 20px;
+            }
+            .card {
+                background: #171717;
+                border: 1px solid #333;
+                border-radius: 15px;
+                padding: 20px;
+                margin: 15px 0;
+            }
+            h1 { color: #f5c542; text-align: center; }
+            .signal {
+                text-align: center;
+                font-size: 32px;
+                color: #f5c542;
+                font-weight: bold;
+            }
+            .stats {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 12px;
+            }
+            .value { font-size: 25px; font-weight: bold; }
+            .green { color: #16c784; }
+            .red { color: #ea3943; }
+            .muted { color: #999; }
+            button {
+                width: 100%;
+                padding: 14px;
+                background: #f5c542;
+                border: none;
+                border-radius: 10px;
+                font-size: 16px;
+                font-weight: bold;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>QUOTEX AI</h1>
+        <p style="text-align:center">OTC Trading Dashboard</p>
+
+        <div class="card">
+            <p class="muted">Market</p>
+            <h2 id="market">EUR/USD OTC</h2>
+            <p class="muted">Latest AI Signal</p>
+            <div class="signal" id="signal">WAITING</div>
+        </div>
+
+        <div class="stats">
+            <div class="card">
+                <p class="muted">UP Probability</p>
+                <div class="value green" id="up">--</div>
+            </div>
+            <div class="card">
+                <p class="muted">DOWN Probability</p>
+                <div class="value red" id="down">--</div>
+            </div>
+            <div class="card">
+                <p class="muted">Confidence</p>
+                <div class="value" id="confidence">--</div>
+            </div>
+            <div class="card">
+                <p class="muted">Trend</p>
+                <div class="value" id="trend">--</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <p class="muted">Momentum</p>
+            <h3 id="momentum">Waiting</h3>
+            <p class="muted">Last Analysis</p>
+            <p id="updated">No analysis yet</p>
+        </div>
+
+        <button onclick="loadData()">REFRESH SIGNAL</button>
+
+        <p class="muted" style="text-align:center">
+            Signals are estimates, not guaranteed outcomes.
+            OTC live prices are not connected.
+        </p>
+
+        <script>
+            async function loadData() {
+                try {
+                    const response = await fetch('/api/signal');
+                    const data = await response.json();
+
+                    document.getElementById('market').textContent = data.market;
+                    document.getElementById('signal').textContent = data.signal;
+                    document.getElementById('up').textContent =
+                        data.up === null ? '--' : data.up + '%';
+                    document.getElementById('down').textContent =
+                        data.down === null ? '--' : data.down + '%';
+                    document.getElementById('confidence').textContent =
+                        data.confidence === null ? '--' : data.confidence + '%';
+                    document.getElementById('trend').textContent = data.trend;
+                    document.getElementById('momentum').textContent = data.momentum;
+                    document.getElementById('updated').textContent = data.updated;
+                } catch (error) {
+                    console.error(error);
+                }
+            }
+
+            loadData();
+            setInterval(loadData, 5000);
+        </script>
+    </body>
+    </html>
+    """)
 
 
 @app.get("/health")
