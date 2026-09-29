@@ -420,6 +420,9 @@ def main():
         drop_pending_updates=True
     )
 
-
+@app.get("/api/signal")
+def get_signal():
+    with dashboard_lock:
+        return jsonify(latest_signal.copy())
 if __name__ == "__main__":
     main()
